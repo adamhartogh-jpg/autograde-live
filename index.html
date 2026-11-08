@@ -1,0 +1,290 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="theme-color" content="#020617">
+  <title>AutoGrade live camera</title>
+  <script src="https://unpkg.com/@zxing/library@0.21.3/umd/index.min.js"></script>
+  <style>
+    :root { color-scheme: dark; }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; background: #020617; color: #f8fafc; font-family: system-ui, sans-serif; }
+    body { display: flex; flex-direction: column; min-height: 100%; }
+    header { padding: 12px 16px 8px; }
+    h1 { margin: 0; font-size: 18px; }
+    #status { margin: 4px 0 0; color: #94a3b8; font-size: 13px; }
+    #stage { position: relative; flex: 1; background: #000; min-height: 0; }
+    video { width: 100%; height: 100%; object-fit: cover; }
+    #gate, #done {
+      position: absolute; inset: 0; display: flex; flex-direction: column; align-items: center; justify-content: center;
+      gap: 12px; padding: 24px; text-align: center; background: rgba(2,6,23,.94);
+    }
+    button {
+      min-height: 56px; width: min(100%, 320px); border: 0; border-radius: 16px;
+      background: #34D186; color: #022c22; font-size: 17px; font-weight: 800;
+    }
+    button.secondary { background: rgba(255,255,255,.12); color: #fff; font-size: 15px; }
+    #hint { position: absolute; left: 12px; right: 12px; top: 12px; text-align: center; font-size: 13px; font-weight: 700;
+      background: rgba(0,0,0,.55); border-radius: 999px; padding: 8px 12px; }
+    #bar { display: flex; gap: 8px; padding: 12px 12px calc(12px + env(safe-area-inset-bottom)); }
+    #bar button { flex: 1; }
+    .hidden { display: none !important; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1 id="title">AutoGrade live camera</h1>
+    <p id="status">This tab is the live camera. Shots come from the camera stream, with GPS and device details.</p>
+  </header>
+  <div id="stage">
+    <video id="video" playsinline muted autoplay></video>
+    <div id="hint" class="hidden"></div>
+    <div id="gate">
+      <p>Safari can ask for the camera on this tab. Google’s inspection page cannot.</p>
+      <button id="start" type="button">Allow camera and location</button>
+    </div>
+    <div id="done" class="hidden">
+      <p id="doneText">All 8 checkpoints are captured.</p>
+      <button id="back" type="button">Return to AutoGrade</button>
+    </div>
+  </div>
+  <div id="bar" class="hidden">
+    <button id="shutter" type="button">Capture</button>
+    <button id="ocr" type="button" class="secondary">Read disc with AI</button>
+  </div>
+  <script>
+    'use strict';
+    const video = document.getElementById('video');
+    const PARENT = '*';
+    const state = { stream: null, geo: null, mode: 'disc', index: 0, checkpoints: [], plate: '', recorder: null, chunks: [], zx: null };
+
+    function say(text) { document.getElementById('status').textContent = text; }
+    function post(msg) { if (window.opener && !window.opener.closed) window.opener.postMessage(msg, PARENT); }
+
+    function deviceInfo() {
+      return {
+        userAgent: navigator.userAgent,
+        platform: navigator.platform || '',
+        language: navigator.language || '',
+        timeZone: Intl.DateTimeFormat().resolvedOptions().timeZone || '',
+        screen: screen.width + 'x' + screen.height + '@' + (window.devicePixelRatio || 1),
+        hardwareConcurrency: navigator.hardwareConcurrency || null,
+        maxTouchPoints: navigator.maxTouchPoints || 0,
+        secureContext: window.isSecureContext,
+      };
+    }
+
+    function evidence(track) {
+      const settings = track && track.getSettings ? track.getSettings() : {};
+      const fix = state.geo;
+      const age = fix ? Date.now() - fix.timestamp : null;
+      return {
+        source: 'live-mediastream',
+        capturedAt: new Date().toISOString(),
+        geo: fix ? {
+          lat: fix.coords.latitude, lng: fix.coords.longitude, accuracy: fix.coords.accuracy,
+          altitude: fix.coords.altitude, altitudeAccuracy: fix.coords.altitudeAccuracy,
+          heading: fix.coords.heading, speed: fix.coords.speed, timestamp: fix.timestamp,
+          stale: age > 20000,
+        } : null,
+        camera: {
+          label: track ? track.label : '',
+          facingMode: settings.facingMode || '',
+          width: settings.width || null,
+          height: settings.height || null,
+          frameRate: settings.frameRate || null,
+          deviceId: settings.deviceId || '',
+        },
+        device: deviceInfo(),
+      };
+    }
+
+    function frameUrl(quality) {
+      const w = video.videoWidth, h = video.videoHeight;
+      if (!w || !h) return '';
+      const scale = Math.min(1, 1280 / Math.max(w, h));
+      const c = document.createElement('canvas');
+      c.width = Math.round(w * scale);
+      c.height = Math.round(h * scale);
+      c.getContext('2d').drawImage(video, 0, 0, c.width, c.height);
+      return c.toDataURL('image/jpeg', quality || 0.72);
+    }
+
+    function setupZxing() {
+      if (!window.ZXing) return;
+      const hints = new Map();
+      hints.set(ZXing.DecodeHintType.POSSIBLE_FORMATS, [ZXing.BarcodeFormat.PDF_417, ZXing.BarcodeFormat.QR_CODE, ZXing.BarcodeFormat.DATA_MATRIX]);
+      hints.set(ZXing.DecodeHintType.TRY_HARDER, true);
+      state.zx = new ZXing.MultiFormatReader();
+      state.zx.setHints(hints);
+      state.hints = hints;
+    }
+
+    function readBarcode() {
+      if (!state.zx || !video.videoWidth) return '';
+      try {
+        const side = Math.min(video.videoWidth, video.videoHeight);
+        const scale = Math.min(1, 900 / side);
+        const c = document.createElement('canvas');
+        c.width = Math.round(side * scale);
+        c.height = c.width;
+        c.getContext('2d').drawImage(video, (video.videoWidth - side) / 2, (video.videoHeight - side) / 2, side, side, 0, 0, c.width, c.height);
+        const lum = new ZXing.HTMLCanvasElementLuminanceSource(c);
+        return state.zx.decode(new ZXing.BinaryBitmap(new ZXing.HybridBinarizer(lum)), state.hints).getText();
+      } catch (err) {
+        return '';
+      }
+    }
+
+    function showCheckpoint() {
+      const cp = state.checkpoints[state.index];
+      if (!cp) { finishWalk(); return; }
+      document.getElementById('title').textContent = (state.index + 1) + '/8 · ' + cp.title;
+      document.getElementById('hint').textContent = cp.hint;
+      document.getElementById('hint').classList.remove('hidden');
+      document.getElementById('shutter').textContent = 'Capture ' + cp.short;
+      document.getElementById('ocr').classList.add('hidden');
+      say(state.plate ? state.plate + ' · point the camera, then capture' : 'Point the camera, then capture');
+    }
+
+    function finishWalk() {
+      document.getElementById('bar').classList.add('hidden');
+      document.getElementById('done').classList.remove('hidden');
+      document.getElementById('doneText').textContent = 'All 8 live photos are in AutoGrade, with GPS and device details. Switch back to that tab and tap Finish & grade.';
+      stopRecorder();
+    }
+
+    function stopRecorder() {
+      const rec = state.recorder;
+      if (!rec || rec.state === 'inactive') return;
+      rec.onstop = async () => {
+        const type = (rec.mimeType || 'video/mp4').split(';')[0];
+        const blob = new Blob(state.chunks, { type: type });
+        if (!blob.size || blob.size > 8 * 1024 * 1024) {
+          post({ type: 'video-skipped', bytes: blob.size });
+          return;
+        }
+        const dataUrl = await new Promise((resolve) => {
+          const r = new FileReader();
+          r.onload = () => resolve(r.result);
+          r.readAsDataURL(blob);
+        });
+        post({ type: 'video', dataUrl: dataUrl, mimeType: type });
+      };
+      rec.stop();
+    }
+
+    function startRecorder(stream) {
+      if (typeof MediaRecorder === 'undefined') return;
+      const types = ['video/mp4', 'video/webm;codecs=vp8', 'video/webm'];
+      const mime = types.find((t) => MediaRecorder.isTypeSupported && MediaRecorder.isTypeSupported(t)) || '';
+      try {
+        state.recorder = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 700000 } : { videoBitsPerSecond: 700000 });
+        state.chunks = [];
+        state.recorder.ondataavailable = (e) => { if (e.data && e.data.size) state.chunks.push(e.data); };
+        state.recorder.start(1000);
+      } catch (err) {
+        state.recorder = null;
+      }
+    }
+
+    document.getElementById('start').onclick = () => {
+      const pending = navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: { facingMode: { ideal: 'environment' }, width: { ideal: 1920 }, height: { ideal: 1080 } },
+      });
+      navigator.geolocation.watchPosition(
+        (pos) => { state.geo = pos; },
+        () => { say('Camera is on. Location is still off — allow Location for Safari so each photo is tagged.'); },
+        { enableHighAccuracy: true, maximumAge: 5000 }
+      );
+      pending.then((stream) => {
+        state.stream = stream;
+        video.srcObject = stream;
+        video.play().catch(() => {});
+        document.getElementById('gate').classList.add('hidden');
+        document.getElementById('bar').classList.remove('hidden');
+        setupZxing();
+        startRecorder(stream);
+        post({ type: 'live-hello', device: deviceInfo() });
+        say('Camera is live. Point it at the licence disc barcode.');
+        scanLoop();
+      }).catch((err) => {
+        say(err.name === 'NotAllowedError'
+          ? 'Camera blocked. Allow Camera and Location for Safari, then tap the button again.'
+          : 'Camera failed: ' + (err.message || err.name));
+      });
+    };
+
+    async function scanLoop() {
+      if (state.mode !== 'disc') return;
+      const raw = readBarcode();
+      if (raw && /MVL/i.test(raw)) {
+        state.mode = 'wait';
+        say('Barcode read. Checking it with AutoGrade…');
+        post({ type: 'barcode', raw: raw, evidence: evidence(state.stream && state.stream.getVideoTracks()[0]) });
+        return;
+      }
+      setTimeout(scanLoop, 450);
+    }
+
+    document.getElementById('shutter').onclick = () => {
+      if (state.mode === 'disc' || state.mode === 'wait') return;
+      const cp = state.checkpoints[state.index];
+      const dataUrl = frameUrl(0.8);
+      if (!cp || !dataUrl) { say('Camera frame is not ready yet.'); return; }
+      const track = state.stream && state.stream.getVideoTracks()[0];
+      post({ type: 'photo', checkpointId: cp.id, dataUrl: dataUrl, evidence: evidence(track) });
+      say('Sending ' + cp.short + '…');
+      document.getElementById('shutter').disabled = true;
+    };
+
+    document.getElementById('ocr').onclick = () => {
+      const dataUrl = frameUrl(0.85);
+      if (!dataUrl) return;
+      state.mode = 'wait';
+      say('Sending the disc photo for AI reading…');
+      post({ type: 'disc-frame', dataUrl: dataUrl, evidence: evidence(state.stream && state.stream.getVideoTracks()[0]) });
+    };
+
+    document.getElementById('back').onclick = () => { window.close(); };
+
+    window.addEventListener('message', (event) => {
+      const msg = event.data || {};
+      if (msg.type === 'live-init') {
+        state.plate = msg.plate || '';
+        state.checkpoints = msg.checkpoints || [];
+        if (msg.hasVehicle) {
+          state.mode = 'walk';
+          state.index = Math.max(0, state.checkpoints.findIndex((c) => c.id === msg.nextId));
+          showCheckpoint();
+        }
+      }
+      if (msg.type === 'barcode-ok') {
+        state.mode = 'walk';
+        state.plate = msg.plate || state.plate;
+        state.index = 0;
+        showCheckpoint();
+      }
+      if (msg.type === 'barcode-fail') {
+        state.mode = 'disc';
+        say(msg.message || 'That barcode was not accepted. Hold the disc steady.');
+        scanLoop();
+      }
+      if (msg.type === 'photo-ok') {
+        document.getElementById('shutter').disabled = false;
+        state.index += 1;
+        showCheckpoint();
+      }
+      if (msg.type === 'photo-fail') {
+        document.getElementById('shutter').disabled = false;
+        say(msg.message || 'AutoGrade could not store that photo. Capture it again.');
+      }
+    });
+
+    if (!window.opener) say('Open this tab from AutoGrade with the Live camera button, so photos can be sent back.');
+    else post({ type: 'live-hello', device: deviceInfo() });
+  </script>
+</body>
+</html>
